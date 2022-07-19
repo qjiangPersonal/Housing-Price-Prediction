@@ -1,0 +1,275 @@
+---
+title: "House Price Prediction Project"
+author: "Qi JIANG"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+### Environment Setup
+
+```{r}
+# Loading packages
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tidyverse)
+library(readr)
+library(naniar)
+library(visdat)
+library(rcompanion)
+library(superml)
+library(forecast)
+library(randomForest)
+
+# Loading data
+# Data source: https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques
+train <- read.csv('train.csv', stringsAsFactors = F)
+test <- read.csv('test.csv', stringsAsFactors = F)
+cat(paste(c("The train data dimension before dropping 'Id' column is "), sep=""), paste("(", sep=""), paste(dim(train), collapse = ","), paste(").", sep=""))
+cat(paste(c("\nThe test data dimension before dropping 'Id' column is "), sep=""), paste("(", sep=""), paste(dim(test), collapse = ","), paste(").", sep=""))
+```
+
+```{r}
+# Dropping 'Id' column
+train <- train[-1]
+test <- test[-1]
+
+# Checking again
+cat(paste(c("\nThe train data dimension after dropping 'Id' column is "), sep=""), paste("(", sep=""), paste(dim(train), collapse = ","), paste(").", sep=""))
+cat(paste(c("\nThe test data dimension after dropping 'Id' column is "), sep=""), paste("(", sep=""), paste(dim(test), collapse = ","), paste(").", sep=""))
+```
+
+# Data Processing
+
+## Target Variable: 'SalePrice'
+
+Let's plot the distribution of *SalePrice*.
+
+```{r}
+options(scipen = 999) # to avoid scientific notation on x-axis
+plotNormalHistogram(train$SalePrice, prob=TRUE, breaks=30, main=c("Distribution of Variable 'SalePrice'"),sub=paste("mean=", mean(train$SalePrice), "\t sd=", sd(train$SalePrice)), xlab=c("Sale Price (in USD)"), ylab=c("Frequency"))
+```
+
+```{r}
+qqnorm(train$SalePrice)
+qqline(train$SalePrice)
+```
+
+The target variable *SalePrice* is right skewed. In order to fit linear regression models, it is more appropriate to do a log-transformation on this variable.
+
+### Log-transformation on Target Variable
+
+```{r}
+train <- mutate(train, logSalePrice = log(SalePrice))
+```
+
+### Checking Again
+
+```{r}
+options(scipen = 999) # to avoid scientific notation on x-axis
+plotNormalHistogram(train$logSalePrice, prob=TRUE, breaks=30, main=c("Distribution of Variable 'SalePrice'"),sub=paste("mean=", mean(train$logSalePrice), "\t sd=", sd(train$logSalePrice)), xlab=c("log(Sale Price)"), ylab=c("Frequency"))
+```
+
+```{r}
+qqnorm(train$logSalePrice)
+qqline(train$logSalePrice)
+```
+
+Now, the skewness is corrected.
+
+## Feature Engineering
+
+Note that we need to apply the same transformation on both train and test data.
+
+```{r}
+# Combining train and test data
+train <- mutate(train, UsedToTrain=TRUE) ## creating an indicator
+test <- mutate(test, UsedToTrain=FALSE, SalePrice=0, logSalePrice=0)
+full <- rbind(train, test)
+cat(paste("The dimension of full dataset is "), paste(dim(full), collapse = ","))
+```
+
+### Missing Data
+
+```{r}
+full.NAratio <- as.data.frame(sort(colMeans(is.na(full))*100, decreasing = TRUE))
+colnames(full.NAratio) <- "MissingRatio"
+full.NAratio <- filter(full.NAratio, MissingRatio>0)
+full.NAratio
+```
+
+```{r}
+ggplot(full.NAratio, aes(x=reorder(row.names(full.NAratio), -MissingRatio), y=MissingRatio)) + geom_bar(stat = "identity") + theme(axis.text.x = element_text(face="bold", color="#993333", size=7, angle=90),axis.text.y = element_text(face="bold", color="#993333", size=7, angle=0)) + ylab("Missing Ratio (%)") + xlab("Variables")
+```
+
+#### Imputation on Non-Random Missing Data
+
+Many *NA* values above represents the absence of a facility, such as *PoolQC*. An *NA* value of *PoolQC* just means that there is no pool in this property. Same cases are variable *Alley,BsmtQual,BsmtCond,BsmtExposure,BsmtFinType1,FireplaceQu,GarageType,GarageFinish,GarageQual,GarageCond,PoolQC,Fence,MiscFeature,BsmtFinType2*.
+
+So, we need to replace these "false" missing values with 'None'.
+
+```{r}
+for (col in c('Alley','BsmtQual','BsmtCond','BsmtExposure','BsmtFinType1','FireplaceQu','GarageType','GarageFinish','GarageQual','GarageCond','PoolQC','Fence','MiscFeature','BsmtFinType2', 'BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2', 'MasVnrType')){
+  full[[col]] <- replace_na(full[[col]], 'None')
+}
+```
+
+#### Imputation on 'LotFrontage'
+
+Since the lengths of lot frontage are very close within a neighborhood, we decide to replace 'NA' in *LotFrontage* of a data point by the median value in its neighborhood.
+
+```{r}
+full <- full %>% group_by(Neighborhood) %>% mutate(LotFrontage=ifelse(is.na(LotFrontage), median(LotFrontage, na.rm=TRUE), LotFrontage))
+```
+
+#### Imputation on Numerical Variables
+
+```{r}
+for (col in c('GarageYrBlt', 'GarageArea', 'GarageCars', 'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF','TotalBsmtSF', 'BsmtFullBath', 'BsmtHalfBath', 'MasVnrArea')){
+  full[[col]] <- replace_na(full[[col]], 0)
+}
+```
+
+#### Other Cases
+
+* *Utilities*: the entire data set have value "AllPub", except one in the train dataset.
+
+```{r}
+table(select(train, Utilities))
+```
+
+```{r}
+table(select(test, Utilities))
+```
+
+So, this feature will not be effective in predictive models. We need to drop variable *Utilities*.
+
+```{r}
+full <- full[,names(full)!='Utilities']
+```
+
+* *Functional*: based on data description, 'NA' means typical
+
+```{r}
+full[['Functional']] <- replace_na(full[['Functional']], 'typical')
+```
+
+* *MSZoning*: there are 4 missing values
+
+```{r}
+table(full$MSZoning)
+sum(is.na(full$MSZoning))
+```
+
+We decide to replace them by the most common value 'RL'.
+
+```{r}
+full[['MSZoning']] <- replace_na(full[['MSZoning']], 'RL')
+
+```
+
+* *Electrical, KitchenQual, Exterior1st, Exterior2nd, SaleType*: each of them has only 1 missing value
+
+```{r}
+apply(full[, c('Electrical', 'KitchenQual', 'Exterior1st', 'Exterior2nd', 'SaleType')], 2, function(x){sum(is.na(x))})
+```
+
+So, we can just drop that data point.
+
+```{r}
+full <- filter(full, !(is.na(Electrical)|is.na(KitchenQual)|is.na(Exterior1st)|is.na(Exterior2nd)|is.na(SaleType)))
+```
+
+### Checking Again for Missing Values
+
+```{r}
+full.NAratio <- as.data.frame(sort(colMeans(is.na(full))*100, decreasing = TRUE))
+colnames(full.NAratio) <- "MissingRatio"
+full.NAratio <- filter(full.NAratio, MissingRatio>0)
+full.NAratio
+```
+
+There is no missing value now!
+
+### Converting Some Numerical Variables That Are Actually Categorical
+
+Variables *MSSubClass,OverallCond,YrSold,MoSold* were entered as numerical data. But they are actually categorical data.
+
+```{r}
+for (col in c("MSSubClass", "OverallCond", "YrSold", "MoSold")){
+  full[[col]] <- as.factor(full[[col]])
+}
+```
+
+### Encoding Some Categorical Variables That Are Ordinal
+
+Variables *FireplaceQu, BsmtQual, BsmtCond, GarageQual, GarageCond, ExterQual, ExterCon,HeatingQC, PoolQC, KitchenQual, BsmtFinType1, BsmtFinType2, Functional, Fence, BsmtExposure, GarageFinish, LandSlope, LotShape, PavedDrive, Street, Alley, CentralAir, MSSubClass, OverallCond, YrSold, MoSold* need to be encoded into ordinal variables.
+
+```{r}
+for (col in c('FireplaceQu', 'BsmtQual', 'BsmtCond', 'GarageQual', 'GarageCond', 
+        'ExterQual', 'ExterCond','HeatingQC', 'PoolQC', 'KitchenQual', 'BsmtFinType1', 
+        'BsmtFinType2', 'Functional', 'Fence', 'BsmtExposure', 'GarageFinish', 'LandSlope',
+        'LotShape', 'PavedDrive', 'Street', 'Alley', 'CentralAir', 'MSSubClass', 'OverallCond', 
+        'YrSold', 'MoSold')){
+  lbl = LabelEncoder$new()
+  full[[col]] = lbl$fit_transform(full[[col]])
+}
+```
+
+
+
+## Chossing Variables
+
+```{r}
+# Selecting these important variables
+predictors <- c('UsedToTrain','MSZoning','Neighborhood','BldgType','HouseStyle','OverallQual','OverallCond','YearBuilt', 'ExterQual','ExterCond','BsmtQual','BsmtCond','TotalBsmtSF','HeatingQC', 'CentralAir','Electrical','GrLivArea','BedroomAbvGr','KitchenAbvGr','KitchenQual','TotRmsAbvGrd','Functional','Fireplaces','FireplaceQu','GarageArea','GarageQual','GarageCond','OpenPorchSF','PoolArea','Fence','MoSold','YrSold','SaleType','SaleCondition','SalePrice','logSalePrice')
+```
+
+## Splitting Train and Test Dataset
+
+```{R}
+train.processed <- full[,predictors] %>% filter(UsedToTrain==TRUE)
+test.processed <- full[,predictors] %>% filter(UsedToTrain==FALSE)
+```
+
+# Modelling
+
+## M1: Linear Regression Model
+
+### Dividing Training and Validation
+
+```{r}
+set.seed(1)
+train.index <- sample(c(1:dim(train.processed)[1]), dim(train.processed)[1]*0.9)
+m1.train <- train.processed[train.index, ]
+m1.valid <- train.processed[-train.index, ]
+```
+
+### Building the Model
+
+```{r}
+m1 <- lm(logSalePrice~.-(logSalePrice+SalePrice+UsedToTrain), data=m1.train)
+```
+
+### Prediction Analysis
+
+```{r}
+m1.pred <- predict(m1, newdata=m1.valid, type="response")
+m1.res <- m1.valid$logSalePrice - m1.pred
+head(cbind("Predicted" = m1.pred, "Actual" = m1.valid$logSalePrice, "Residual" = m1.res), n=10)
+```
+
+```{r}
+accuracy(m1.pred, m1.valid$logSalePrice)
+```
+
+```{r}
+plot(m1.pred, m1.valid$logSalePrice, main = "Predicted vs. Actual logSalePrice") 
+abline(0,1)
+```
